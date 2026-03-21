@@ -29,6 +29,7 @@
 // Incoming connection logger for experiment analysis.
 
 #include "incoming_connection_logger.h"
+#include <boost/filesystem.hpp>
 #include <chrono>
 #include <iomanip>
 #include <sstream>
@@ -46,6 +47,21 @@ void incoming_connection_logger::init(const std::string& log_path)
   if (m_initialized)
     return;
   m_log_path = log_path;
+  try
+  {
+    boost::filesystem::path p(log_path);
+    boost::filesystem::path parent = p.parent_path();
+    if (!parent.empty())
+      boost::filesystem::create_directories(parent);
+    std::ofstream f(m_log_path, std::ios::app);
+    if (f)
+    {
+      auto now = std::chrono::system_clock::now();
+      auto sec = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+      f << "[" << sec << ".000] LOG_STARTED incoming_connections\n";
+    }
+  }
+  catch (...) {}
   m_initialized = true;
 }
 
