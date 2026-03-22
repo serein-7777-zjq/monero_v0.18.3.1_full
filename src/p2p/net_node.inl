@@ -43,6 +43,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <tuple>
 #include <vector>
 
@@ -61,12 +62,15 @@
 #include "cryptonote_core/cryptonote_core.h"
 #include "net/parse.h"
 
+#include "outbound_connection_logger.h"
 #include <miniupnp/miniupnpc/miniupnpc.h>
 #include <miniupnp/miniupnpc/upnpcommands.h>
 #include <miniupnp/miniupnpc/upnperrors.h>
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "net.p2p"
+
+#define OUTBOUND_DBG(x) do { std::ostringstream _odb; _odb << x; nodetool::outbound_debug_log(_odb.str()); } while(0)
 
 #define NET_MAKE_IP(b1,b2,b3,b4)  ((LPARAM)(((DWORD)(b1)<<24)+((DWORD)(b2)<<16)+((DWORD)(b3)<<8)+((DWORD)(b4))))
 
@@ -963,6 +967,7 @@ namespace nodetool
     }
 
     m_incoming_connection_logger.init(m_config_folder + "/monero_incoming_connections.log");
+    nodetool::outbound_debug_log_init(m_config_folder + "/monero_outbound_connections.log");
 
     res = init_config();
     CHECK_AND_ASSERT_MES(res, false, "Failed to init config.");
@@ -1180,6 +1185,7 @@ namespace nodetool
   template<class t_payload_net_handler>
   bool node_server<t_payload_net_handler>::do_handshake_with_peer(peerid_type& pi, p2p_connection_context& context_, bool just_take_peerlist)
   {
+    OUTBOUND_DBG("do_handshake START " << context_.m_remote_address.str() << " just_take_peerlist=" << just_take_peerlist << " -> sending COMMAND_HANDSHAKE(1001)");
     network_zone& zone = m_network_zones.at(context_.m_remote_address.get_zone());
 
     typename COMMAND_HANDSHAKE::request arg;
@@ -1408,25 +1414,34 @@ namespace nodetool
   template<class t_payload_net_handler>
   bool node_server<t_payload_net_handler>::try_to_connect_and_handshake_with_new_peer(const epee::net_utils::network_address& na, bool just_take_peerlist, uint64_t last_seen_stamp, PeerType peer_type, uint64_t first_seen_stamp)
   {
+    const char* purpose = just_take_peerlist ? "SEED_TAKE_PEERLIST" : "FULL_OUTBOUND";
+    OUTBOUND_DBG("try_to_connect START " << na.str() << " purpose=" << purpose << " peer_type=" << peer_type);
+
     network_zone& zone = m_network_zones.at(na.get_zone());
-    if (zone.m_connect == nullptr) // outgoing connections in zone not possible
+    if (zone.m_connect == nullptr) { // outgoing connections in zone not possible
+      OUTBOUND_DBG("try_to_connect FAIL " << na.str() << " reason=zone_m_connect_null");
       return false;
+    }
 
-    if (zone.m_our_address == na)
+    if (zone.m_our_address == na) {
+      OUTBOUND_DBG("try_to_connect SKIP " << na.str() << " reason=self");
       return false;
+    }
 
-    if (zone.m_current_number_of_out_peers == zone.m_config.m_net_config.max_out_connection_count) // out peers limit
-    {
+    if (zone.m_current_number_of_out_peers == zone.m_config.m_net_config.max_out_connection_count) { // out peers limit
+      OUTBOUND_DBG("try_to_connect SKIP " << na.str() << " reason=max_out_reached");
       return false;
     }
     else if (zone.m_current_number_of_out_peers > zone.m_config.m_net_config.max_out_connection_count)
     {
       zone.m_net_server.get_config_object().del_out_connections(1);
       --(zone.m_current_number_of_out_peers); // atomic variable, update time = 1s
+      OUTBOUND_DBG("try_to_connect SKIP " << na.str() << " reason=over_max_out_del_one");
       return false;
     }
 
 
+    OUTBOUND_DBG("try_to_connect TCP+1001 " << na.str() << " EXPECT_COMMAND_HANDSHAKE (not PING probe)");
     MDEBUG("Connecting to " << na.str() << "(peer_type=" << peer_type << ", last_seen: "
         << (last_seen_stamp ? epee::misc_utils::get_time_interval_string(time(NULL) - last_seen_stamp):"never")
         << ")...");
@@ -1434,12 +1449,14 @@ namespace nodetool
     auto con = zone.m_connect(zone, na, m_ssl_support);
     if(!con)
     {
+      OUTBOUND_DBG("try_to_connect FAIL " << na.str() << " reason=connect_returned_null");
       bool is_priority = is_priority_node(na);
       LOG_PRINT_CC_PRIORITY_NODE(is_priority, bool(con), "Connect failed to " << na.str()
         /*<< ", try " << try_count*/);
       record_addr_failed(na);
       return false;
     }
+    OUTBOUND_DBG("try_to_connect TCP_OK " << na.str() << " -> do_handshake (1001)");
 
     con->m_anchor = peer_type == anchor;
     peerid_type pi = AUTO_VAL_INIT(pi);
@@ -1447,6 +1464,7 @@ namespace nodetool
 
     if(!res)
     {
+      OUTBOUND_DBG("try_to_connect FAIL " << na.str() << " reason=handshake_failed");
       bool is_priority = is_priority_node(na);
       LOG_PRINT_CC_PRIORITY_NODE(is_priority, *con, "Failed to HANDSHAKE with peer "
         << na.str()
@@ -1457,6 +1475,7 @@ namespace nodetool
 
     if(just_take_peerlist)
     {
+      OUTBOUND_DBG("try_to_connect OK " << na.str() << " SEED_TAKE_PEERLIST -> close (by design)");
       zone.m_net_server.get_config_object().close(con->m_connection_id);
       LOG_DEBUG_CC(*con, "CONNECTION HANDSHAKED OK AND CLOSED.");
       return true;
@@ -1483,6 +1502,7 @@ namespace nodetool
     zone.m_notifier.on_handshake_complete(con->m_connection_id, con->m_is_income);
     zone.m_notifier.new_out_connection();
 
+    OUTBOUND_DBG("try_to_connect OK " << na.str() << " FULL_OUTBOUND handshake_done stable");
     LOG_DEBUG_CC(*con, "CONNECTION HANDSHAKED OK.");
     return true;
   }
@@ -1553,22 +1573,28 @@ namespace nodetool
   template<class t_payload_net_handler>
   bool node_server<t_payload_net_handler>::make_new_connection_from_anchor_peerlist(const std::vector<anchor_peerlist_entry>& anchor_peerlist)
   {
+    OUTBOUND_DBG("make_new_connection_from_anchor_peerlist anchor_count=" << anchor_peerlist.size());
     for (const auto& pe: anchor_peerlist) {
+      OUTBOUND_DBG("anchor candidate " << pe.adr.str() << " peer_id=" << peerid_to_string(pe.id));
       _note("Considering connecting (out) to anchor peer: " << peerid_to_string(pe.id) << " " << pe.adr.str());
 
       if(is_peer_used(pe)) {
+        OUTBOUND_DBG("skip anchor " << pe.adr.str() << " reason=is_peer_used");
         _note("Peer is used");
         continue;
       }
 
       if(!is_remote_host_allowed(pe.adr)) {
+        OUTBOUND_DBG("skip anchor " << pe.adr.str() << " reason=blocked");
         continue;
       }
 
       if(is_addr_recently_failed(pe.adr)) {
+        OUTBOUND_DBG("skip anchor " << pe.adr.str() << " reason=recently_failed");
         continue;
       }
 
+      OUTBOUND_DBG("SELECTED anchor " << pe.adr.str() << " -> calling try_to_connect_and_handshake (FULL_OUTBOUND)");
       MDEBUG("Selected peer: " << peerid_to_string(pe.id) << " " << pe.adr.str()
                                << "[peer_type=" << anchor
                                << "] first_seen: " << epee::misc_utils::get_time_interval_string(time(NULL) - pe.first_seen));
@@ -1587,6 +1613,10 @@ namespace nodetool
   template<class t_payload_net_handler>
   bool node_server<t_payload_net_handler>::make_new_connection_from_peerlist(network_zone& zone, bool use_white_list)
   {
+    const char* list_src = use_white_list ? "WHITE" : "GRAY";
+    size_t total_peers = use_white_list ? zone.m_peerlist.get_white_peers_count() : zone.m_peerlist.get_gray_peers_count();
+    OUTBOUND_DBG("make_new_connection_from_peerlist list=" << list_src << " total_peers=" << total_peers);
+
     size_t max_random_index = 0;
 
     std::set<size_t> tried_peers;
@@ -1639,9 +1669,11 @@ namespace nodetool
       });
       if (filtered.empty())
       {
+        OUTBOUND_DBG("no candidates after foreach list=" << list_src << " pruning_stripe=" << next_needed_pruning_stripe);
         MINFO("No available peer in " << (use_white_list ? "white" : "gray") << " list filtered by " << next_needed_pruning_stripe);
         return false;
       }
+      OUTBOUND_DBG("foreach produced " << filtered.size() << " candidates list=" << list_src << " pruning_stripe=" << next_needed_pruning_stripe);
       if (use_white_list)
       {
         // if using the white list, we first pick in the set of peers we've already been using earlier
@@ -1681,36 +1713,47 @@ namespace nodetool
 
       ++try_count;
 
+      OUTBOUND_DBG("candidate #" << try_count << " " << pe.adr.str() << " list=" << list_src << " peer_id=" << peerid_to_string(pe.id));
       _note("Considering connecting (out) to " << (use_white_list ? "white" : "gray") << " list peer: " <<
           peerid_to_string(pe.id) << " " << pe.adr.str() << ", pruning seed " << epee::string_tools::to_string_hex(pe.pruning_seed) <<
           " (stripe " << next_needed_pruning_stripe << " needed)");
 
-      if(zone.m_our_address == pe.adr)
+      if(zone.m_our_address == pe.adr) {
+        OUTBOUND_DBG("skip " << pe.adr.str() << " reason=self");
         continue;
+      }
 
       if(is_peer_used(pe)) {
+        OUTBOUND_DBG("skip " << pe.adr.str() << " reason=is_peer_used");
         _note("Peer is used");
         continue;
       }
 
-      if(!is_remote_host_allowed(pe.adr))
+      if(!is_remote_host_allowed(pe.adr)) {
+        OUTBOUND_DBG("skip " << pe.adr.str() << " reason=blocked");
         continue;
+      }
 
-      if(is_addr_recently_failed(pe.adr))
+      if(is_addr_recently_failed(pe.adr)) {
+        OUTBOUND_DBG("skip " << pe.adr.str() << " reason=recently_failed");
         continue;
+      }
 
+      OUTBOUND_DBG("SELECTED " << pe.adr.str() << " list=" << list_src << " -> calling try_to_connect_and_handshake (FULL_OUTBOUND)");
       MDEBUG("Selected peer: " << peerid_to_string(pe.id) << " " << pe.adr.str()
                     << ", pruning seed " << epee::string_tools::to_string_hex(pe.pruning_seed) << " "
                     << "[peer_list=" << (use_white_list ? white : gray)
                     << "] last_seen: " << (pe.last_seen ? epee::misc_utils::get_time_interval_string(time(NULL) - pe.last_seen) : "never"));
 
       if(!try_to_connect_and_handshake_with_new_peer(pe.adr, false, pe.last_seen, use_white_list ? white : gray)) {
+        OUTBOUND_DBG("peer " << pe.adr.str() << " try_to_connect FAILED -> try next");
         _note("Handshake failed");
         continue;
       }
 
       return true;
     }
+    OUTBOUND_DBG("make_new_connection_from_peerlist EXHAUSTED list=" << list_src << " try_count=" << try_count);
     return false;
   }
   //-----------------------------------------------------------------------------------
@@ -1801,6 +1844,10 @@ namespace nodetool
     for(auto& zone : m_network_zones)
     {
       size_t start_conn_count = get_outgoing_connections_count(zone.second);
+      size_t max_out = zone.second.m_config.m_net_config.max_out_connection_count;
+      OUTBOUND_DBG("connections_maker zone=" << epee::net_utils::zone_to_string(zone.first)
+        << " current_out=" << start_conn_count << " max_out=" << max_out
+        << " gap=" << (max_out > start_conn_count ? max_out - start_conn_count : 0));
       if(!zone.second.m_peerlist.get_white_peers_count() && !connect_to_seed(zone.first))
       {
         continue;
@@ -1880,6 +1927,10 @@ namespace nodetool
       if(zone.m_net_server.is_stop_signal_sent())
         return false;
 
+      const char* pt_str = (peer_type == anchor) ? "anchor" : (peer_type == white) ? "white" : "gray";
+      OUTBOUND_DBG("make_expected_connections peer_type=" << pt_str
+        << " conn_count=" << conn_count << " expected=" << expected_connections
+        << " (need " << (expected_connections - conn_count) << " more)");
       MDEBUG("Making expected connection, type " << peer_type << ", " << conn_count << "/" << expected_connections << " connections");
 
       if (peer_type == anchor && !make_new_connection_from_anchor_peerlist(apl)) {
@@ -2315,6 +2366,9 @@ namespace nodetool
   template<class t_payload_net_handler> template<class t_callback>
   bool node_server<t_payload_net_handler>::try_ping(basic_node_data& node_data, p2p_connection_context& context, const t_callback &cb)
   {
+    OUTBOUND_DBG("try_ping START (BACK_PING_PROBE) from INC peer " << context.m_remote_address.host_str()
+      << " -> will connect_async to " << context.m_remote_address.host_str() << ":" << node_data.my_port
+      << " send_1003_only_then_close");
     if(!node_data.my_port)
       return false;
 
@@ -2362,9 +2416,11 @@ namespace nodetool
     {
       if(ec)
       {
+        OUTBOUND_DBG("BACK_PING_PROBE " << address.str() << " connect_async failed ec=" << ec.message());
         LOG_WARNING_CC(ping_context, "back ping connect failed to " << address.str());
         return false;
       }
+      OUTBOUND_DBG("BACK_PING_PROBE " << address.str() << " TCP_OK -> sending 1003 (PING) will_close_after_response");
       COMMAND_PING::request req;
       COMMAND_PING::response rsp;
       //vc2010 workaround
@@ -2390,10 +2446,12 @@ namespace nodetool
         network_zone& zone = m_network_zones.at(address.get_zone());
         if(rsp.status != PING_OK_RESPONSE_STATUS_TEXT || pr != rsp.peer_id)
         {
+          OUTBOUND_DBG("BACK_PING_PROBE " << address.str() << " wrong_response -> close (by design)");
           LOG_WARNING_CC(ping_context, "back ping invoke wrong response \"" << rsp.status << "\" from" << address.str() << ", hsh_peer_id=" << pr_ << ", rsp.peer_id=" << peerid_to_string(rsp.peer_id));
           zone.m_net_server.get_config_object().close(ping_context.m_connection_id);
           return;
         }
+        OUTBOUND_DBG("BACK_PING_PROBE " << address.str() << " 1003_OK -> close (by design) NO_HANDSHAKE this_is_expected");
         zone.m_net_server.get_config_object().close(ping_context.m_connection_id);
         cb();
       });
