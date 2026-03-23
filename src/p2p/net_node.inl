@@ -1428,15 +1428,22 @@ namespace nodetool
       return false;
     }
 
-    if (zone.m_current_number_of_out_peers == zone.m_config.m_net_config.max_out_connection_count) { // out peers limit
-      OUTBOUND_DBG("try_to_connect SKIP " << na.str() << " reason=max_out_reached");
-      return false;
-    }
-    else if (zone.m_current_number_of_out_peers > zone.m_config.m_net_config.max_out_connection_count)
+    // Use get_outgoing_connections_count (live) instead of m_current_number_of_out_peers (stale ~1s)
+    // to stay consistent with connections_maker and avoid false max_out_reached when a slot freed
+    const size_t current_out = get_outgoing_connections_count(zone);
+    const size_t max_out = zone.m_config.m_net_config.max_out_connection_count;
+    if (current_out >= max_out)
     {
-      zone.m_net_server.get_config_object().del_out_connections(1);
-      --(zone.m_current_number_of_out_peers); // atomic variable, update time = 1s
-      OUTBOUND_DBG("try_to_connect SKIP " << na.str() << " reason=over_max_out_del_one");
+      if (current_out > max_out)
+      {
+        zone.m_net_server.get_config_object().del_out_connections(1);
+        --(zone.m_current_number_of_out_peers);
+        OUTBOUND_DBG("try_to_connect SKIP " << na.str() << " reason=over_max_out_del_one");
+      }
+      else
+      {
+        OUTBOUND_DBG("try_to_connect SKIP " << na.str() << " reason=max_out_reached");
+      }
       return false;
     }
 
