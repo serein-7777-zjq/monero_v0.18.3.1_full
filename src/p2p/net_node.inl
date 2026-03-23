@@ -1636,7 +1636,34 @@ namespace nodetool
       size_t random_index;
       const uint32_t next_needed_pruning_stripe = m_payload_handler.get_next_needed_pruning_stripe().second;
 
-      // canonical host string: normalize IPv6 v4-mapped to IPv4 so 192.168.1.1 and ::ffff:192.168.1.1 match
+      // build a set of all the /16 we're connected to, and prefer a peer that's not in that set
+      std::set<uint32_t> classB;
+      if (&zone == &m_network_zones.at(epee::net_utils::zone::public_)) // at returns reference, not copy
+      {
+        zone.m_net_server.get_config_object().foreach_connection([&](const p2p_connection_context& cntxt)
+        {
+          if (cntxt.m_remote_address.get_type_id() == epee::net_utils::ipv4_network_address::get_type_id())
+          {
+            const epee::net_utils::network_address na = cntxt.m_remote_address;
+            const uint32_t actual_ip = na.as<const epee::net_utils::ipv4_network_address>().ip();
+            classB.insert(actual_ip & 0x0000ffff);
+          }
+          else if (cntxt.m_remote_address.get_type_id() == epee::net_utils::ipv6_network_address::get_type_id())
+          {
+            const epee::net_utils::network_address na = cntxt.m_remote_address;
+            const boost::asio::ip::address_v6 &actual_ip = na.as<const epee::net_utils::ipv6_network_address>().ip();
+            if (actual_ip.is_v4_mapped())
+            {
+              boost::asio::ip::address_v4 v4ip = make_address_v4_from_v6(actual_ip);
+              uint32_t actual_ipv4;
+              memcpy(&actual_ipv4, v4ip.to_bytes().data(), sizeof(actual_ipv4));
+              classB.insert(actual_ipv4 & ntohl(0xffff0000));
+            }
+          }
+          return true;
+        });
+      }
+
       auto get_host_string = [](const epee::net_utils::network_address &address) {
         if (address.get_type_id() == epee::net_utils::ipv6_network_address::get_type_id())
         {
@@ -1651,18 +1678,6 @@ namespace nodetool
         }
         return address.host_str();
       };
-
-      // build a set of IPs we already have OUTGOING connections to (incoming connections ignored)
-      std::unordered_set<std::string> outgoing_ips;
-      zone.m_net_server.get_config_object().foreach_connection([&](const p2p_connection_context& cntxt)
-      {
-        if (!cntxt.m_is_income)  // outgoing only
-          outgoing_ips.insert(get_host_string(cntxt.m_remote_address));
-        return true;
-      });
-
-      // B subnet filtering disabled (classB kept empty)
-      std::set<uint32_t> classB;
       std::unordered_set<std::string> hosts_added;
       std::deque<size_t> filtered;
       const size_t limit = use_white_list ? 20 : std::numeric_limits<size_t>::max();
@@ -1670,14 +1685,11 @@ namespace nodetool
       {
         bool skip_duplicate_class_B = step == 0;
         size_t idx = 0, skipped = 0;
-        zone.m_peerlist.foreach (use_white_list, [&outgoing_ips, &classB, &filtered, &idx, &skipped, skip_duplicate_class_B, limit, next_needed_pruning_stripe, &hosts_added, &get_host_string](const peerlist_entry &pe){
+        zone.m_peerlist.foreach (use_white_list, [&classB, &filtered, &idx, &skipped, skip_duplicate_class_B, limit, next_needed_pruning_stripe, &hosts_added, &get_host_string](const peerlist_entry &pe){
           if (filtered.size() >= limit)
             return false;
           bool skip = false;
-          // skip peers whose IP already has an outgoing connection (same IP as current outbound)
-          if (outgoing_ips.count(get_host_string(pe.adr)))
-            skip = true;
-          else if (skip_duplicate_class_B && pe.adr.get_type_id() == epee::net_utils::ipv4_network_address::get_type_id())
+          if (skip_duplicate_class_B && pe.adr.get_type_id() == epee::net_utils::ipv4_network_address::get_type_id())
           {
             const epee::net_utils::network_address na = pe.adr;
             uint32_t actual_ip = na.as<const epee::net_utils::ipv4_network_address>().ip();
@@ -1711,7 +1723,7 @@ namespace nodetool
           else if (next_needed_pruning_stripe == tools::get_pruning_stripe(pe.pruning_seed))
             filtered.push_front(idx);
           ++idx;
-          // hosts_added.insert(get_host_string(pe.adr));
+          hosts_added.insert(get_host_string(pe.adr));
           return true;
         });
         if (skipped == 0 || !filtered.empty())
