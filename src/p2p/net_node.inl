@@ -1685,15 +1685,22 @@ namespace nodetool
       {
         bool skip_duplicate_class_B = step == 0;
         size_t idx = 0, skipped = 0;
-        zone.m_peerlist.foreach (use_white_list, [&classB, &filtered, &idx, &skipped, skip_duplicate_class_B, limit, next_needed_pruning_stripe, &hosts_added, &get_host_string](const peerlist_entry &pe){
+        size_t skipped_class_b_subnet = 0;
+        size_t skipped_host_dup = 0;
+        size_t skipped_pruning_mismatch = 0;
+        size_t accepted_push_back = 0;
+        size_t accepted_push_front = 0;
+        zone.m_peerlist.foreach (use_white_list, [&classB, &filtered, &idx, &skipped, skip_duplicate_class_B, limit, next_needed_pruning_stripe, &hosts_added, &get_host_string, &skipped_class_b_subnet, &skipped_host_dup, &skipped_pruning_mismatch, &accepted_push_back, &accepted_push_front](const peerlist_entry &pe){
           if (filtered.size() >= limit)
             return false;
           bool skip = false;
+          bool skip_due_class_b = false;
           if (skip_duplicate_class_B && pe.adr.get_type_id() == epee::net_utils::ipv4_network_address::get_type_id())
           {
             const epee::net_utils::network_address na = pe.adr;
             uint32_t actual_ip = na.as<const epee::net_utils::ipv4_network_address>().ip();
             skip = classB.find(actual_ip & 0x0000ffff) != classB.end();
+            skip_due_class_b = skip;
           }
           else if (skip_duplicate_class_B && pe.adr.get_type_id() == epee::net_utils::ipv6_network_address::get_type_id())
           {
@@ -1705,27 +1712,49 @@ namespace nodetool
               uint32_t actual_ipv4;
               memcpy(&actual_ipv4, v4ip.to_bytes().data(), sizeof(actual_ipv4));
               skip = classB.find(actual_ipv4 & ntohl(0xffff0000)) != classB.end();
+              skip_due_class_b = skip;
             }
           }
+          if (skip_due_class_b)
+            ++skipped_class_b_subnet;
 
           // consider each host once, to avoid giving undue influence to hosts running several nodes
           if (!skip)
           {
             const auto i = hosts_added.find(get_host_string(pe.adr));
             if (i != hosts_added.end())
+            {
               skip = true;
+              ++skipped_host_dup;
+            }
           }
 
           if (skip)
             ++skipped;
           else if (next_needed_pruning_stripe == 0 || pe.pruning_seed == 0)
+          {
             filtered.push_back(idx);
+            ++accepted_push_back;
+          }
           else if (next_needed_pruning_stripe == tools::get_pruning_stripe(pe.pruning_seed))
+          {
             filtered.push_front(idx);
+            ++accepted_push_front;
+          }
+          else
+            ++skipped_pruning_mismatch;
           ++idx;
           hosts_added.insert(get_host_string(pe.adr));
           return true;
         });
+        OUTBOUND_DBG("peerlist_filter list=" << list_src << " step=" << step
+          << " next_needed_pruning_stripe=" << next_needed_pruning_stripe
+          << " skipped_class_b_subnet=" << skipped_class_b_subnet
+          << " skipped_host_dup=" << skipped_host_dup
+          << " skipped_pruning_mismatch=" << skipped_pruning_mismatch
+          << " accepted_push_back=" << accepted_push_back
+          << " accepted_push_front=" << accepted_push_front
+          << " filtered_size=" << filtered.size());
         if (skipped == 0 || !filtered.empty())
           break;
         if (skipped)
@@ -2430,7 +2459,7 @@ namespace nodetool
   template<class t_payload_net_handler> template<class t_callback>
   bool node_server<t_payload_net_handler>::try_ping(basic_node_data& node_data, p2p_connection_context& context, const t_callback &cb)
   {
-    OUTBOUND_DBG("try_ping START (BACK_PING_PROBE) from INC peer " << context.m_remote_address.host_str()
+    MDEBUG("try_ping START (BACK_PING_PROBE) from INC peer " << context.m_remote_address.host_str()
       << " -> will connect_async to " << context.m_remote_address.host_str() << ":" << node_data.my_port
       << " send_1003_only_then_close");
     if(!node_data.my_port)
@@ -2480,11 +2509,11 @@ namespace nodetool
     {
       if(ec)
       {
-        OUTBOUND_DBG("BACK_PING_PROBE " << address.str() << " connect_async failed ec=" << ec.message());
+        MDEBUG("BACK_PING_PROBE " << address.str() << " connect_async failed ec=" << ec.message());
         LOG_WARNING_CC(ping_context, "back ping connect failed to " << address.str());
         return false;
       }
-      OUTBOUND_DBG("BACK_PING_PROBE " << address.str() << " TCP_OK -> sending 1003 (PING) will_close_after_response");
+      MDEBUG("BACK_PING_PROBE " << address.str() << " TCP_OK -> sending 1003 (PING) will_close_after_response");
       COMMAND_PING::request req;
       COMMAND_PING::response rsp;
       //vc2010 workaround
@@ -2510,12 +2539,12 @@ namespace nodetool
         network_zone& zone = m_network_zones.at(address.get_zone());
         if(rsp.status != PING_OK_RESPONSE_STATUS_TEXT || pr != rsp.peer_id)
         {
-          OUTBOUND_DBG("BACK_PING_PROBE " << address.str() << " wrong_response -> close (by design)");
+          MDEBUG("BACK_PING_PROBE " << address.str() << " wrong_response -> close (by design)");
           LOG_WARNING_CC(ping_context, "back ping invoke wrong response \"" << rsp.status << "\" from" << address.str() << ", hsh_peer_id=" << pr_ << ", rsp.peer_id=" << peerid_to_string(rsp.peer_id));
           zone.m_net_server.get_config_object().close(ping_context.m_connection_id);
           return;
         }
-        OUTBOUND_DBG("BACK_PING_PROBE " << address.str() << " 1003_OK -> close (by design) NO_HANDSHAKE this_is_expected");
+        MDEBUG("BACK_PING_PROBE " << address.str() << " 1003_OK -> close (by design) NO_HANDSHAKE this_is_expected");
         zone.m_net_server.get_config_object().close(ping_context.m_connection_id);
         cb();
       });
